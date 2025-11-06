@@ -1,11 +1,12 @@
 """
-NQESH Question Validator with Context Caching.
+NQESH Question Validator with Context Caching and Batch Validation.
 
 This version uses Gemini's context caching to efficiently
 validate multiple questions against the same source documents.
 
 Key features:
-- Uses context caching for source documents
+- Uses Gemini Caching API for source documents
+- Batch validation to reduce API calls (validate multiple questions at once)
 - Reduced API costs and faster validation
 - Explicit file state verification
 """
@@ -15,13 +16,15 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from google import genai
+from google.genai import types
 
 from src.nqesh_generator.models.question_models import QuestionBank, Question
 from src.nqesh_generator.models.validation_models import (
     ValidationReport,
     QuestionValidationResult,
     CategoryValidationSummary,
-    ValidationIssue
+    ValidationIssue,
+    BatchValidationResult
 )
 from src.nqesh_generator import config
 from src.nqesh_generator.utils.env_loader import load_env
@@ -51,7 +54,8 @@ class NQESHQuestionValidator:
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name or config.VALIDATOR_MODEL_NAME
         self.uploaded_files = []
-        self.cached_content = None
+        self.cached_content = None  # Will hold the actual Gemini CachedContent object
+        self.batch_size = 10  # Validate 10 questions per API call
 
     def upload_source_files(self, files_dir: str = "files") -> List[Any]:
         """
@@ -76,40 +80,56 @@ class NQESHQuestionValidator:
 
         for file_path in file_list:
             if file_path.is_file():
-                print(f"  Uploading: {file_path.name}")
-                uploaded_file = self.client.files.upload(file=str(file_path))
-                self.uploaded_files.append(uploaded_file)
-                print(f"    ✓ File URI: {uploaded_file.uri}")
+                # Skip hidden files and files without extensions (like .gitkeep)
+                if file_path.name.startswith('.'):
+                    print(f"  Skipping hidden file: {file_path.name}")
+                    continue
 
-                # Verify file is accessible by checking metadata
                 try:
-                    verified_file = self.client.files.get(name=uploaded_file.name)
-                    print(f"    ✓ File verified: {verified_file.state if hasattr(verified_file, 'state') else 'active'}")
+                    print(f"  Uploading: {file_path.name}")
+                    uploaded_file = self.client.files.upload(file=str(file_path))
+                    self.uploaded_files.append(uploaded_file)
+                    print(f"    ✓ File URI: {uploaded_file.uri}")
+
+                    # Verify file is accessible by checking metadata
+                    try:
+                        verified_file = self.client.files.get(name=uploaded_file.name)
+                        print(f"    ✓ File verified: {verified_file.state if hasattr(verified_file, 'state') else 'active'}")
+                    except Exception as e:
+                        print(f"    ⚠️ Warning: Could not verify file access: {e}")
                 except Exception as e:
-                    print(f"    ⚠️ Warning: Could not verify file access: {e}")
+                    print(f"    ✗ Error uploading {file_path.name}: {e}")
+                    print(f"    Skipping this file and continuing...")
 
         print(f"\n✓ Successfully uploaded and verified {len(self.uploaded_files)} source files\n")
         return self.uploaded_files
 
-    def create_cached_content(self) -> Any:
+    def create_cached_content(self, ttl: str = "3600s") -> Any:
         """
-        Create a cached content object with source documents.
+        Create a cached content object using Gemini's Caching API.
         This allows efficient reuse of the same context across multiple validations.
 
+        Args:
+            ttl: Time-to-live for the cache (e.g., "3600s" = 1 hour)
+
         Returns:
-            Cached content object
+            CachedContent object from Gemini API
         """
         if not self.uploaded_files:
             raise ValueError("No source files uploaded. Call upload_source_files() first.")
 
-        print("Creating cached content for efficient validation...")
+        print("Creating cached content using Gemini Caching API...")
+        print(f"  Cache TTL: {ttl}")
 
         # Prepare content with all source files
         cache_contents = []
 
         for file in self.uploaded_files:
             cache_contents.append(
-                {"file_data": {"mime_type": file.mime_type, "file_uri": file.uri}}
+                types.Part.from_uri(
+                    file_uri=file.uri,
+                    mime_type=file.mime_type
+                )
             )
 
         # Add base system instruction to cache
@@ -125,20 +145,138 @@ If something cannot be verified or is incorrect, clearly identify it and explain
 
 The source documents have been uploaded and you must reference them when validating questions."""
 
-        cache_contents.append(validation_system_instruction)
+        # Create the cache using Gemini's Caching API
+        try:
+            self.cached_content = self.client.caches.create(
+                model=self.model_name,
+                config=types.CreateCachedContentConfig(
+                    display_name=f"nqesh_validator_{len(self.uploaded_files)}_files",
+                    system_instruction=validation_system_instruction,
+                    contents=cache_contents,
+                    ttl=ttl,
+                )
+            )
 
-        # Create cached content (if supported by the model)
-        # Note: Context caching is done automatically by the Gemini API when the same
-        # content is used across multiple requests. We structure it to maximize reuse.
+            print(f"✓ Cache created successfully!")
+            print(f"  Cache name: {self.cached_content.name}")
+            print(f"  Expires: {self.cached_content.expire_time}")
+            print("  → Multiple validations will reuse this cached context\n")
 
-        self.cached_content = {
-            "files": self.uploaded_files,
-            "base_instruction": validation_system_instruction,
-            "contents": cache_contents
+            return self.cached_content
+
+        except Exception as e:
+            print(f"⚠️ Warning: Could not create cache: {e}")
+            print("  Falling back to non-cached validation (still works, just not optimized)\n")
+            self.cached_content = None
+            return None
+
+    def validate_batch_questions(
+        self,
+        questions: List[Question],
+        category_name: str,
+        category_id: str
+    ) -> List[QuestionValidationResult]:
+        """
+        Validate multiple questions in a single API call (batch validation).
+        This significantly reduces API costs compared to per-question validation.
+
+        Args:
+            questions: List of Question objects to validate
+            category_name: Name of the category
+            category_id: ID of the category
+
+        Returns:
+            List of QuestionValidationResult objects
+        """
+        if not self.uploaded_files:
+            raise ValueError("No source files uploaded. Call upload_source_files() first.")
+
+        if not self.cached_content:
+            raise ValueError("Cached content not created. Call create_cached_content() first.")
+
+        # Format all questions for batch validation
+        questions_data = []
+        for q in questions:
+            questions_data.append({
+                "question_id": q.question_id,
+                "question": q.question,
+                "options": q.options,
+                "correct_answer": q.correct_answer,
+                "explanation": q.explanation,
+                "source": q.source
+            })
+
+        # Prepare batch validation prompt
+        batch_prompt = f"""You are validating multiple test questions from the **{category_name}** category against the source documents.
+
+Below are {len(questions)} questions to validate in this batch. For EACH question, perform a thorough validation:
+
+**QUESTIONS TO VALIDATE:**
+{json.dumps(questions_data, indent=2, ensure_ascii=False)}
+
+---
+
+**YOUR VALIDATION TASKS FOR EACH QUESTION:**
+
+1. **Factual Accuracy**: Search through the provided source documents to verify if this question's content is based on actual information. If you cannot find supporting evidence, note this as a factual error.
+
+2. **Answer Correctness**: Based on the source documents, is the stated correct answer actually correct? If not, identify what the correct answer should be.
+
+3. **Explanation Accuracy**: Does the explanation correctly reference and accurately represent information from the source documents?
+
+4. **Options Quality**: Are all four options plausible and distinct?
+
+5. **Source Verification**: Can you find the information in the documents? Which specific document, section, or item number?
+
+**IMPORTANT**:
+- Validate ALL {len(questions)} questions in this batch
+- Be thorough and precise for each question
+- Quote specific sections from source documents when relevant
+- If you cannot find evidence, clearly state this
+- Assign a confidence score (0.0 to 1.0) for each question
+- Return results in the specified BatchValidationResult format
+
+Provide your validation assessment for all questions in the structured format requested."""
+
+        # Prepare generation config
+        generation_config = {
+            "response_mime_type": "application/json",
+            "response_json_schema": BatchValidationResult.model_json_schema()
         }
 
-        print("✓ Cached content prepared for validation\n")
-        return self.cached_content
+        # Use cached content
+        if self.cached_content:
+            generation_config["cached_content"] = self.cached_content.name
+            contents = batch_prompt
+        else:
+            # Fallback without cache (shouldn't happen but handle it)
+            contents = []
+            for file in self.uploaded_files:
+                contents.append(
+                    types.Part.from_uri(
+                        file_uri=file.uri,
+                        mime_type=file.mime_type
+                    )
+                )
+            contents.append(batch_prompt)
+
+        print(f"  Validating batch of {len(questions)} questions (using cached context)...")
+
+        # Generate validation with structured output
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=contents,
+            config=generation_config
+        )
+
+        # Parse response into Pydantic model
+        batch_result = BatchValidationResult.model_validate_json(response.text)
+
+        # Ensure all results have the correct category_id
+        for result in batch_result.results:
+            result.category_id = category_id
+
+        return batch_result.results
 
     def validate_single_question(
         self,
@@ -242,13 +380,17 @@ Provide your validation assessment in the structured format requested."""
 
     def validate_question_bank(
         self,
-        question_bank_file: str = None
+        question_bank_file: str = None,
+        use_batch: bool = True,
+        batch_size: Optional[int] = None
     ) -> ValidationReport:
         """
-        Validate an entire question bank with caching.
+        Validate an entire question bank with caching and batch validation.
 
         Args:
             question_bank_file: Path to the question bank JSON file (defaults to output/nqesh_questions.json)
+            use_batch: Whether to use batch validation (default True, much faster and cheaper)
+            batch_size: Number of questions per batch (default 10, max recommended 20)
 
         Returns:
             ValidationReport object
@@ -272,11 +414,17 @@ Provide your validation assessment in the structured format requested."""
 
         all_results: List[QuestionValidationResult] = []
 
+        # Set batch size
+        effective_batch_size = batch_size or self.batch_size
+
         print("="*70)
-        print("STARTING VALIDATION (with context caching)")
+        if use_batch:
+            print(f"STARTING BATCH VALIDATION (batch size: {effective_batch_size}, with caching)")
+        else:
+            print("STARTING VALIDATION (per-question, with caching)")
         print("="*70 + "\n")
 
-        # Validate each question
+        # Validate questions
         for category in question_bank.categories:
             category_questions = question_bank.questions.get(category.id, [])
 
@@ -284,45 +432,91 @@ Provide your validation assessment in the structured format requested."""
                 continue
 
             print(f"\nValidating category: {category.name}")
-            print(f"  Questions in category: {len(category_questions)}\n")
+            print(f"  Questions in category: {len(category_questions)}")
 
-            for question in category_questions:
-                try:
-                    result = self.validate_single_question(
-                        question=question,
-                        category_name=category.name,
-                        category_id=category.id
-                    )
-                    all_results.append(result)
+            if use_batch:
+                # Batch validation - much more efficient
+                num_batches = (len(category_questions) + effective_batch_size - 1) // effective_batch_size
+                print(f"  Processing in {num_batches} batch(es)\n")
 
-                    status = "✓ VALID" if result.is_valid else "✗ ISSUES FOUND"
-                    print(f"    {status} - {question.question_id} (confidence: {result.confidence_score:.2f})")
+                for i in range(0, len(category_questions), effective_batch_size):
+                    batch = category_questions[i:i + effective_batch_size]
+                    batch_num = (i // effective_batch_size) + 1
 
-                except Exception as e:
-                    print(f"    ✗ ERROR validating {question.question_id}: {e}")
-                    failed_result = QuestionValidationResult(
-                        question_id=question.question_id,
-                        category_id=category.id,
-                        is_valid=False,
-                        is_factually_accurate=False,
-                        is_answer_correct=False,
-                        is_explanation_accurate=False,
-                        are_options_valid=False,
-                        issues=[ValidationIssue(
-                            severity="critical",
-                            issue_type="validation_error",
-                            description=f"Validation process failed: {str(e)}"
-                        )],
-                        confidence_score=0.0,
-                        notes=f"Validation error: {str(e)}"
-                    )
-                    all_results.append(failed_result)
+                    try:
+                        print(f"  Batch {batch_num}/{num_batches}: Validating {len(batch)} questions...")
+                        batch_results = self.validate_batch_questions(
+                            questions=batch,
+                            category_name=category.name,
+                            category_id=category.id
+                        )
+                        all_results.extend(batch_results)
+
+                        # Show summary of batch results
+                        valid_in_batch = sum(1 for r in batch_results if r.is_valid)
+                        print(f"    ✓ Batch complete: {valid_in_batch}/{len(batch)} valid")
+
+                    except Exception as e:
+                        print(f"    ✗ ERROR in batch {batch_num}: {e}")
+                        # Create error results for all questions in failed batch
+                        for question in batch:
+                            failed_result = QuestionValidationResult(
+                                question_id=question.question_id,
+                                category_id=category.id,
+                                is_valid=False,
+                                is_factually_accurate=False,
+                                is_answer_correct=False,
+                                is_explanation_accurate=False,
+                                are_options_valid=False,
+                                issues=[ValidationIssue(
+                                    severity="critical",
+                                    issue_type="validation_error",
+                                    description=f"Batch validation failed: {str(e)}"
+                                )],
+                                confidence_score=0.0,
+                                notes=f"Batch validation error: {str(e)}"
+                            )
+                            all_results.append(failed_result)
+            else:
+                # Per-question validation (original method, slower and more expensive)
+                print()
+                for question in category_questions:
+                    try:
+                        result = self.validate_single_question(
+                            question=question,
+                            category_name=category.name,
+                            category_id=category.id
+                        )
+                        all_results.append(result)
+
+                        status = "✓ VALID" if result.is_valid else "✗ ISSUES FOUND"
+                        print(f"    {status} - {question.question_id} (confidence: {result.confidence_score:.2f})")
+
+                    except Exception as e:
+                        print(f"    ✗ ERROR validating {question.question_id}: {e}")
+                        failed_result = QuestionValidationResult(
+                            question_id=question.question_id,
+                            category_id=category.id,
+                            is_valid=False,
+                            is_factually_accurate=False,
+                            is_answer_correct=False,
+                            is_explanation_accurate=False,
+                            are_options_valid=False,
+                            issues=[ValidationIssue(
+                                severity="critical",
+                                issue_type="validation_error",
+                                description=f"Validation process failed: {str(e)}"
+                            )],
+                            confidence_score=0.0,
+                            notes=f"Validation error: {str(e)}"
+                        )
+                        all_results.append(failed_result)
 
         print("\n" + "="*70)
         print("VALIDATION COMPLETE")
         print("="*70 + "\n")
 
-        # Generate report (same as v1)
+        # Generate report
         return self._generate_validation_report(question_bank, all_results)
 
     def _generate_validation_report(
@@ -460,12 +654,22 @@ Provide your validation assessment in the structured format requested."""
         return "".join(md)
 
     def cleanup_files(self):
-        """Delete uploaded files from Gemini."""
-        print("\nCleaning up uploaded files...")
+        """Delete uploaded files and cached content from Gemini."""
+        print("\nCleaning up...")
+
+        # Delete cache first
+        if self.cached_content:
+            try:
+                self.client.caches.delete(name=self.cached_content.name)
+                print(f"  ✓ Deleted cache: {self.cached_content.name}")
+            except Exception as e:
+                print(f"  ✗ Error deleting cache: {e}")
+
+        # Delete uploaded files
         for file in self.uploaded_files:
             try:
                 self.client.files.delete(name=file.name)
-                print(f"  ✓ Deleted: {file.name}")
+                print(f"  ✓ Deleted file: {file.name}")
             except Exception as e:
                 print(f"  ✗ Error deleting {file.name}: {e}")
 

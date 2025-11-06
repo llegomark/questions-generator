@@ -138,18 +138,24 @@ class TestGeneratorCachedContent:
     """Test cached content creation."""
 
     def test_create_cached_content_success(self, mock_env_vars, mock_uploaded_files):
-        """Test creating cached content successfully."""
+        """Test creating cached content successfully with real Gemini caching API."""
         with patch('src.nqesh_generator.core.generator.genai.Client'):
             generator = NQESHQuestionGenerator()
             generator.uploaded_files = mock_uploaded_files
 
+            # Mock the caches.create response
+            mock_cache = Mock()
+            mock_cache.name = "cachedContents/test123"
+            mock_cache.expire_time = "2025-01-01T12:00:00Z"
+            generator.client.caches.create = Mock(return_value=mock_cache)
+
             cached = generator.create_cached_content()
 
             assert cached is not None
-            assert "files" in cached
-            assert "system_instruction" in cached
-            assert "contents" in cached
-            assert len(cached["files"]) == len(mock_uploaded_files)
+            assert hasattr(cached, 'name')
+            assert cached.name == "cachedContents/test123"
+            assert generator.cached_content == cached
+            generator.client.caches.create.assert_called_once()
 
     def test_create_cached_content_no_files(self, mock_env_vars):
         """Test creating cached content without uploaded files."""
@@ -162,19 +168,27 @@ class TestGeneratorCachedContent:
             assert "No files uploaded" in str(exc_info.value)
 
     def test_cached_content_structure(self, mock_env_vars, mock_uploaded_files):
-        """Test the structure of cached content."""
+        """Test that cached content is a real Gemini cache object."""
         with patch('src.nqesh_generator.core.generator.genai.Client'):
             generator = NQESHQuestionGenerator()
             generator.uploaded_files = mock_uploaded_files
 
+            # Mock the caches.create response
+            mock_cache = Mock()
+            mock_cache.name = "cachedContents/test456"
+            mock_cache.expire_time = "2025-01-01T13:00:00Z"
+            generator.client.caches.create = Mock(return_value=mock_cache)
+
             cached = generator.create_cached_content()
 
-            # Verify structure
-            assert isinstance(cached["contents"], list)
-            assert len(cached["contents"]) == len(mock_uploaded_files) + 1  # files + instruction
+            # Verify it's a cache object with proper attributes
+            assert hasattr(cached, 'name')
+            assert hasattr(cached, 'expire_time')
+            assert cached.name.startswith("cachedContents/")
 
-            # Last item should be system instruction
-            assert cached["contents"][-1] == generator.system_instruction
+            # Verify caches.create was called with proper config
+            call_args = generator.client.caches.create.call_args
+            assert call_args is not None
 
 
 # ============================================================================
@@ -220,14 +234,18 @@ class TestGeneratorQuestionGeneration:
             generator.client.models.generate_content = Mock(return_value=mock_generate_response)
 
             custom_prompt = "Generate questions about leadership only"
-            question_bank = generator.generate_questions(prompt=custom_prompt)
+            question_bank = generator.generate_questions(prompt=custom_prompt, use_cache=False)
 
             assert isinstance(question_bank, QuestionBank)
 
-            # Verify custom prompt was used
+            # Verify custom prompt was used (check both contents and string format)
             call_args = generator.client.models.generate_content.call_args
             contents = call_args.kwargs['contents']
-            assert any(custom_prompt in str(content) for content in contents)
+            # Contents might be a string or list, check appropriately
+            if isinstance(contents, str):
+                assert custom_prompt in contents
+            else:
+                assert any(custom_prompt in str(content) for content in contents)
 
     def test_generate_questions_with_cache(
         self, mock_env_vars, mock_uploaded_files, mock_generate_response
@@ -318,22 +336,29 @@ class TestGeneratorRegeneration:
     def test_regenerate_with_different_prompt(
         self, mock_env_vars, mock_uploaded_files, mock_generate_response
     ):
-        """Test regenerating questions with different prompt."""
+        """Test regenerating questions with different prompt using real cache."""
         with patch('src.nqesh_generator.core.generator.genai.Client'):
             generator = NQESHQuestionGenerator()
             generator.uploaded_files = mock_uploaded_files
-            # Cached content needs all required fields
-            generator.cached_content = {
-                "files": mock_uploaded_files,
-                "system_instruction": generator.system_instruction,
-                "contents": []
-            }
+
+            # Mock real cache object (not dict)
+            mock_cache = Mock()
+            mock_cache.name = "cachedContents/test789"
+            mock_cache.expire_time = "2025-01-01T14:00:00Z"
+            generator.cached_content = mock_cache
+
             generator.client.models.generate_content = Mock(return_value=mock_generate_response)
 
             new_prompt = "Focus on legal aspects only"
             question_bank = generator.regenerate_with_different_prompt(new_prompt)
 
             assert isinstance(question_bank, QuestionBank)
+
+            # Verify cache was used
+            call_args = generator.client.models.generate_content.call_args
+            config = call_args.kwargs['config']
+            assert 'cached_content' in config
+            assert config['cached_content'] == mock_cache.name
 
 
 # ============================================================================

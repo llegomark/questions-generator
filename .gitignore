@@ -213,3 +213,7 @@ output/*
 # NQESH Generator Input Files
 files/*
 !files/.gitkeep
+
+# Internal Docs
+docs/*
+!docs/.gitkeep

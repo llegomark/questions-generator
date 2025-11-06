@@ -5,17 +5,18 @@ This version uses Gemini's context caching to efficiently
 generate questions across multiple runs or iterations.
 
 Features:
-- Explicit context caching for source documents
+- Explicit context caching for source documents using Gemini Caching API
 - File state verification after upload
 - Support for multiple generation runs with same files
 - Optimized for iterative prompt development
-- Reduced API costs for repeated generations
+- Reduced API costs for repeated generations (cached tokens are cheaper)
 """
 import os
 import json
 from pathlib import Path
 from typing import List, Optional, Any
 from google import genai
+from google.genai import types
 
 from src.nqesh_generator.models.question_models import QuestionBank, Category, Question
 from src.nqesh_generator import config
@@ -52,7 +53,7 @@ class NQESHQuestionGenerator:
         self.system_instruction = system_instruction or config.SYSTEM_INSTRUCTION
         self.default_num_questions = default_num_questions or config.DEFAULT_NUM_QUESTIONS_PER_CATEGORY
         self.uploaded_files = []
-        self.cached_content = None
+        self.cached_content = None  # Will hold the actual Gemini CachedContent object
 
     def upload_files(self, files_dir: str = "files") -> List[Any]:
         """
@@ -79,59 +80,89 @@ class NQESHQuestionGenerator:
 
         for file_path in file_list:
             if file_path.is_file():
-                print(f"  Uploading: {file_path.name}")
-                uploaded_file = self.client.files.upload(file=str(file_path))
-                self.uploaded_files.append(uploaded_file)
-                print(f"    ✓ File URI: {uploaded_file.uri}")
+                # Skip hidden files and files without extensions (like .gitkeep)
+                if file_path.name.startswith('.'):
+                    print(f"  Skipping hidden file: {file_path.name}")
+                    continue
 
-                # Verify file is accessible
                 try:
-                    verified_file = self.client.files.get(name=uploaded_file.name)
-                    state = verified_file.state if hasattr(verified_file, 'state') else 'ACTIVE'
-                    print(f"    ✓ File verified: {state}")
+                    print(f"  Uploading: {file_path.name}")
+                    uploaded_file = self.client.files.upload(file=str(file_path))
+                    self.uploaded_files.append(uploaded_file)
+                    print(f"    ✓ File URI: {uploaded_file.uri}")
+
+                    # Verify file is accessible
+                    try:
+                        verified_file = self.client.files.get(name=uploaded_file.name)
+                        state = verified_file.state if hasattr(verified_file, 'state') else 'ACTIVE'
+                        print(f"    ✓ File verified: {state}")
+                    except Exception as e:
+                        print(f"    ⚠️ Warning: Could not verify file access: {e}")
                 except Exception as e:
-                    print(f"    ⚠️ Warning: Could not verify file access: {e}")
+                    print(f"    ✗ Error uploading {file_path.name}: {e}")
+                    print(f"    Skipping this file and continuing...")
 
         print(f"\n✓ Successfully uploaded and verified {len(self.uploaded_files)} files\n")
         return self.uploaded_files
 
-    def create_cached_content(self) -> Any:
+    def create_cached_content(self, ttl: str = "3600s") -> Any:
         """
-        Create a cached content object with source documents and system instruction.
+        Create a cached content object using Gemini's Caching API.
         This allows efficient reuse when generating questions multiple times.
 
+        The cache stores:
+        - All uploaded source documents
+        - System instruction
+
+        Args:
+            ttl: Time-to-live for the cache (e.g., "3600s" = 1 hour, "7200s" = 2 hours)
+                 Default is 1 hour. Max is 1 hour for free tier.
+
         Returns:
-            Cached content object
+            CachedContent object from Gemini API
         """
         if not self.uploaded_files:
             raise ValueError("No files uploaded. Call upload_files() first.")
 
-        print("Creating cached content for efficient question generation...")
+        print("Creating cached content using Gemini Caching API...")
+        print(f"  Cache TTL: {ttl}")
 
-        # Prepare content with all source files and system instruction
+        # Prepare content with all source files
         cache_contents = []
 
-        # Add all uploaded files to cache
+        # Add all uploaded files to cache as Content objects
         for file in self.uploaded_files:
             cache_contents.append(
-                {"file_data": {"mime_type": file.mime_type, "file_uri": file.uri}}
+                types.Part.from_uri(
+                    file_uri=file.uri,
+                    mime_type=file.mime_type
+                )
             )
 
-        # Add system instruction to cache
-        # This ensures the base context (files + instructions) is reused
-        cache_contents.append(self.system_instruction)
+        # Create the cache using Gemini's Caching API
+        try:
+            self.cached_content = self.client.caches.create(
+                model=self.model_name,
+                config=types.CreateCachedContentConfig(
+                    display_name=f"nqesh_question_gen_{len(self.uploaded_files)}_files",
+                    system_instruction=self.system_instruction,
+                    contents=cache_contents,
+                    ttl=ttl,
+                )
+            )
 
-        # Store cached content structure
-        self.cached_content = {
-            "files": self.uploaded_files,
-            "system_instruction": self.system_instruction,
-            "contents": cache_contents
-        }
+            print(f"✓ Cache created successfully!")
+            print(f"  Cache name: {self.cached_content.name}")
+            print(f"  Expires: {self.cached_content.expire_time}")
+            print("  → Multiple generations will reuse this cached context\n")
 
-        print("✓ Cached content prepared (files + system instruction)")
-        print("  → Multiple generations will reuse this cached context\n")
+            return self.cached_content
 
-        return self.cached_content
+        except Exception as e:
+            print(f"⚠️ Warning: Could not create cache: {e}")
+            print("  Falling back to non-cached generation (still works, just not optimized)\n")
+            self.cached_content = None
+            return None
 
     def generate_questions(
         self,
@@ -164,39 +195,35 @@ class NQESHQuestionGenerator:
         default_prompt = config.DEFAULT_PROMPT_TEMPLATE.format(num_questions=num_questions)
         prompt_to_use = prompt or default_prompt
 
-        # Prepare content
-        contents = []
+        # Prepare generation config
+        generation_config = {
+            "response_mime_type": "application/json",
+            "response_json_schema": QuestionBank.model_json_schema()
+        }
 
+        # Use cached content if available
         if use_cache and self.cached_content:
-            # Use cached files and system instruction
-            print(f"Generating questions using {self.model_name} (with cached context)...")
+            print(f"Generating questions using {self.model_name} (with Gemini cache)...")
+            print("  → Using cached context (files + system instruction)")
+            generation_config["cached_content"] = self.cached_content.name
 
-            # Add files from cache
-            for file in self.uploaded_files:
-                contents.append(
-                    {"file_data": {"mime_type": file.mime_type, "file_uri": file.uri}}
-                )
-
-            # Add generation prompt (only this part is new)
-            contents.append(prompt_to_use)
-
-            # Use cached system instruction
-            system_instruction_to_use = self.cached_content["system_instruction"]
-
+            # When using cache, only send the new prompt
+            contents = prompt_to_use
         else:
-            # Standard generation without explicit cache optimization
-            print(f"Generating questions using {self.model_name}...")
+            # Standard generation without cache
+            print(f"Generating questions using {self.model_name} (without cache)...")
 
-            # Add uploaded files
+            # Need to include files and system instruction in every call
+            contents = []
             for file in self.uploaded_files:
                 contents.append(
-                    {"file_data": {"mime_type": file.mime_type, "file_uri": file.uri}}
+                    types.Part.from_uri(
+                        file_uri=file.uri,
+                        mime_type=file.mime_type
+                    )
                 )
-
-            # Add the prompt
             contents.append(prompt_to_use)
-
-            system_instruction_to_use = self.system_instruction
+            generation_config["system_instruction"] = self.system_instruction
 
         print("This may take a few moments as the model analyzes the documents...\n")
 
@@ -204,12 +231,16 @@ class NQESHQuestionGenerator:
         response = self.client.models.generate_content(
             model=self.model_name,
             contents=contents,
-            config={
-                "system_instruction": system_instruction_to_use,
-                "response_mime_type": "application/json",
-                "response_json_schema": QuestionBank.model_json_schema()
-            }
+            config=generation_config
         )
+
+        # Display token usage if using cache
+        if use_cache and self.cached_content and hasattr(response, 'usage_metadata'):
+            usage = response.usage_metadata
+            if hasattr(usage, 'cached_content_token_count'):
+                print(f"  💰 Cached tokens used: {usage.cached_content_token_count}")
+                print(f"  📝 New tokens processed: {usage.prompt_token_count}")
+                print(f"  💡 Output tokens: {usage.candidates_token_count}\n")
 
         # Parse response into Pydantic model
         question_bank = QuestionBank.model_validate_json(response.text)
@@ -331,12 +362,22 @@ Output in the standard QuestionBank format."""
         print(f"✓ Questions saved to: {output_path}")
 
     def cleanup_files(self):
-        """Delete uploaded files from Gemini."""
-        print("\nCleaning up uploaded files...")
+        """Delete uploaded files and cached content from Gemini."""
+        print("\nCleaning up...")
+
+        # Delete cache first
+        if self.cached_content:
+            try:
+                self.client.caches.delete(name=self.cached_content.name)
+                print(f"  ✓ Deleted cache: {self.cached_content.name}")
+            except Exception as e:
+                print(f"  ✗ Error deleting cache: {e}")
+
+        # Delete uploaded files
         for file in self.uploaded_files:
             try:
                 self.client.files.delete(name=file.name)
-                print(f"  ✓ Deleted: {file.name}")
+                print(f"  ✓ Deleted file: {file.name}")
             except Exception as e:
                 print(f"  ✗ Error deleting {file.name}: {e}")
 

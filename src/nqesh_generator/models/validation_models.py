@@ -84,6 +84,13 @@ class CategoryValidationSummary(BaseModel):
     average_confidence: float = Field(ge=0.0, le=1.0)
 
 
+class BatchValidationResult(BaseModel):
+    """Result of validating multiple questions in a batch."""
+    results: List[QuestionValidationResult] = Field(
+        description="List of validation results for each question in the batch"
+    )
+
+
 class ValidationReport(BaseModel):
     """Complete validation report for the entire question bank."""
     validation_timestamp: str = Field(

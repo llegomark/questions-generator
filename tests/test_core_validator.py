@@ -111,18 +111,24 @@ class TestValidatorCachedContent:
     """Test cached content creation for validation."""
 
     def test_create_cached_content_success(self, mock_env_vars, mock_uploaded_files):
-        """Test creating cached content successfully."""
+        """Test creating cached content successfully with real Gemini caching API."""
         with patch('src.nqesh_generator.core.validator.genai.Client'):
             validator = NQESHQuestionValidator()
             validator.uploaded_files = mock_uploaded_files
 
+            # Mock the caches.create response
+            mock_cache = Mock()
+            mock_cache.name = "cachedContents/validator123"
+            mock_cache.expire_time = "2025-01-01T15:00:00Z"
+            validator.client.caches.create = Mock(return_value=mock_cache)
+
             cached = validator.create_cached_content()
 
             assert cached is not None
-            assert "files" in cached
-            assert "base_instruction" in cached
-            assert "contents" in cached
-            assert len(cached["files"]) == len(mock_uploaded_files)
+            assert hasattr(cached, 'name')
+            assert cached.name == "cachedContents/validator123"
+            assert validator.cached_content == cached
+            validator.client.caches.create.assert_called_once()
 
     def test_create_cached_content_no_files(self, mock_env_vars):
         """Test creating cached content without uploaded files."""
@@ -135,17 +141,27 @@ class TestValidatorCachedContent:
             assert "No source files uploaded" in str(exc_info.value)
 
     def test_cached_content_structure(self, mock_env_vars, mock_uploaded_files):
-        """Test the structure of cached content."""
+        """Test that cached content is a real Gemini cache object."""
         with patch('src.nqesh_generator.core.validator.genai.Client'):
             validator = NQESHQuestionValidator()
             validator.uploaded_files = mock_uploaded_files
 
+            # Mock the caches.create response
+            mock_cache = Mock()
+            mock_cache.name = "cachedContents/validator456"
+            mock_cache.expire_time = "2025-01-01T16:00:00Z"
+            validator.client.caches.create = Mock(return_value=mock_cache)
+
             cached = validator.create_cached_content()
 
-            # Verify structure
-            assert isinstance(cached["contents"], list)
-            # Should have files + base instruction
-            assert len(cached["contents"]) == len(mock_uploaded_files) + 1
+            # Verify it's a cache object with proper attributes
+            assert hasattr(cached, 'name')
+            assert hasattr(cached, 'expire_time')
+            assert cached.name.startswith("cachedContents/")
+
+            # Verify caches.create was called with proper config
+            call_args = validator.client.caches.create.call_args
+            assert call_args is not None
 
 
 # ============================================================================
