@@ -44,7 +44,7 @@ if [ ! -f ".env" ]; then
     cp .env.example .env
     echo ""
     echo "Please edit .env file and add your GEMINI_API_KEY"
-    echo "Or the API key is already configured: AIzaSyCp1goWqZVQlbUvRSm-CJPWw2q4BScUQ5c"
+    echo "Or the API key is already configured."
 else
     echo "✓ .env file exists"
 fi
